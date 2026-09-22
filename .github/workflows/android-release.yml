@@ -1,0 +1,127 @@
+name: Android Signed Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Unique release tag (for example: selfhosted-4.11.0-r1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-signed-release
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Set up JDK 17
+      uses: actions/setup-java@v6
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v6
+    - name: Generate configuration files
+      env:
+        HABITICA_PROPERTIES_B64: ${{ secrets.HABITICA_PROPERTIES_B64 }}
+        HABITICA_RESOURCES_B64: ${{ secrets.HABITICA_RESOURCES_B64 }}
+        GOOGLE_SERVICES_JSON_B64: ${{ secrets.GOOGLE_SERVICES_JSON_B64 }}
+      run: |
+        if [ -z "$HABITICA_PROPERTIES_B64" ] || [ -z "$HABITICA_RESOURCES_B64" ] || [ -z "$GOOGLE_SERVICES_JSON_B64" ]; then
+          echo "::error::One or more application configuration secrets are missing."
+          exit 1
+        fi
+
+        printf '%s' "$HABITICA_PROPERTIES_B64" | base64 --decode > habitica.properties
+        printf '%s' "$HABITICA_RESOURCES_B64" | base64 --decode > habitica.resources
+        printf '%s' "$GOOGLE_SERVICES_JSON_B64" | base64 --decode > Habitica/google-services.json
+    - name: Generate release signing files
+      env:
+        ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      run: |
+        if [ -z "$ANDROID_KEYSTORE_B64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ]; then
+          echo "::error::One or more Android signing secrets are missing."
+          exit 1
+        fi
+
+        printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/habitica-release.p12"
+        chmod 600 "$RUNNER_TEMP/habitica-release.p12"
+
+        {
+          printf 'STORE_FILE=%s\n' "$RUNNER_TEMP/habitica-release.p12"
+          printf 'STORE_PASSWORD=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+          printf 'KEY_ALIAS=%s\n' "$ANDROID_KEY_ALIAS"
+          printf 'KEY_PASSWORD=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+        } > signingrelease.properties
+        chmod 600 signingrelease.properties
+    - name: Make Gradle wrapper executable
+      run: chmod +x gradlew
+    - name: Build signed phone APK
+      run: ./gradlew :Habitica:assembleProdRelease -PdisablePreDex "-Dorg.gradle.jvmargs=-Xmx2g"
+    - name: Verify signed phone APK
+      run: |
+        APK_PATH="$(find Habitica/build/outputs/apk/prod/release -maxdepth 1 -type f -name '*.apk' ! -name '*-unsigned.apk' -print -quit)"
+        if [ -z "$APK_PATH" ]; then
+          echo "::error::No signed ProdRelease APK was produced."
+          exit 1
+        fi
+
+        APKSIGNER_PATH="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print | sort -V | tail -n 1)"
+        if [ -z "$APKSIGNER_PATH" ]; then
+          echo "::error::apksigner was not found in the Android SDK."
+          exit 1
+        fi
+
+        "$APKSIGNER_PATH" verify --verbose --print-certs "$APK_PATH"
+        printf 'APK_PATH=%s\n' "$APK_PATH" >> "$GITHUB_ENV"
+    - name: Prepare release assets
+      run: |
+        cp "$APK_PATH" habitica-selfhosted-release.apk
+        sha256sum habitica-selfhosted-release.apk > habitica-selfhosted-release.apk.sha256
+    - name: Upload signed phone APK
+      uses: actions/upload-artifact@v7
+      with:
+        name: habitica-selfhosted-release
+        path: |
+          habitica-selfhosted-release.apk
+          habitica-selfhosted-release.apk.sha256
+        if-no-files-found: error
+    - name: Publish GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ inputs.release_tag }}
+        RELEASE_COMMIT: ${{ github.sha }}
+      run: |
+        if [[ ! "$RELEASE_TAG" =~ ^selfhosted-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          echo "::error::Release tag must start with 'selfhosted-' and contain only letters, numbers, dots, underscores, and hyphens."
+          exit 1
+        fi
+
+        if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+          echo "::error::GitHub Release '$RELEASE_TAG' already exists. Choose a new tag."
+          exit 1
+        fi
+
+        gh release create "$RELEASE_TAG" \
+          habitica-selfhosted-release.apk \
+          habitica-selfhosted-release.apk.sha256 \
+          --target "$RELEASE_COMMIT" \
+          --title "Habitica Self-Hosted $RELEASE_TAG" \
+          --notes "Signed self-hosted ProdRelease APK built from commit $RELEASE_COMMIT." \
+          --generate-notes \
+          --latest
+    - name: Remove signing material
+      if: always()
+      run: |
+        rm -f signingrelease.properties
+        rm -f "$RUNNER_TEMP/habitica-release.p12"
