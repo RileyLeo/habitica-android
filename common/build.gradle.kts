@@ -39,6 +39,10 @@ android {
 
         val hrpgProps = Properties().apply { load(FileInputStream(File(projectDir.absolutePath + "/../habitica.properties"))) }
         hrpgProps.forEach { key, value -> buildConfigField("String", key as String, "\"${value}\"") }
+        val baseUrl =
+            hrpgProps.getProperty("BASE_URL")?.takeIf { it.isNotBlank() }
+                ?: error("BASE_URL must be set in habitica.properties")
+        resValue("string", "base_url", baseUrl)
     }
 
     buildTypes {

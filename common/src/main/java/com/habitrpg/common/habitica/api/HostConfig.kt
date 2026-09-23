@@ -52,7 +52,7 @@ class HostConfig {
             if (addressValid) {
                 this.address = address
             } else {
-                this.address = context.getString(com.habitrpg.common.habitica.R.string.base_url)
+                this.address = BuildConfig.BASE_URL
             }
         }
         this.userID = sharedPreferences.getString(context.getString(com.habitrpg.common.habitica.R.string.SP_userID), null) ?: ""
